@@ -4,14 +4,19 @@
   "private": true,
   "description": "ระบบอนุมัติการเบิกสินค้าตัวอย่าง",
   "type": "commonjs",
-  "engines": { "node": ">=22.13" },
+  "engines": { "node": ">=22" },
   "scripts": {
     "start": "node server/index.js",
+    "bootstrap": "node server/bootstrap.js",
     "seed-demo": "node server/seed-demo.js",
     "test": "node --test test/*.test.js"
   },
   "dependencies": {
     "exceljs": "^4.4.0",
-    "express": "^4.21.0"
+    "express": "^4.21.0",
+    "pg": "^8.13.0"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.3.0"
   }
 }

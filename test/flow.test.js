@@ -1,24 +1,24 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { createApp } = require('../server/app');
-const { hashPassword } = require('../server/db');
+const { hashPassword, openDb } = require('../server/db');
 
 // Boots the real app on a random port with an in-memory DB.
 async function setup() {
-  const app = createApp(':memory:');
-  const db = app.locals.db;
+  const db = await openDb(':memory:');
+  await db.ensureSchema();
+  const app = createApp(db);
   const pw = hashPassword('Passw0rd!');
-  const mk = (u, name, role, must = 0) =>
-    Number(db.prepare('INSERT INTO users (username,password_hash,full_name,department,role,must_change_password) VALUES (?,?,?,?,?,?)')
-      .run(u, pw, name, 'X', role, must).lastInsertRowid);
-  const ids = {
-    req: mk('req', 'ผู้ขอ', 'requester'), req2: mk('req2', 'ผู้ขอสอง', 'requester'),
-    a1: mk('a1', 'บอส1', 'approver'), a2: mk('a2', 'บอส2', 'approver'),
-    wh: mk('wh', 'คลัง', 'warehouse'), admin: mk('admin', 'แอดมิน', 'admin'), hr: mk('hr', 'เอชอาร์', 'hr'),
-  };
-  db.prepare('INSERT INTO approver_links VALUES (?,?)').run(ids.req, ids.a1);
-  db.prepare('INSERT INTO approver_links VALUES (?,?)').run(ids.req, ids.a2);
-  db.prepare("INSERT INTO products (code,name,unit) VALUES ('P1','สินค้า 1','ชิ้น'),('P2','สินค้า 2','กล่อง')").run();
+  const mk = async (u, name, role, must = 0) =>
+    (await db.q('INSERT INTO users (username,password_hash,full_name,department,role,must_change_password) VALUES (?,?,?,?,?,?) RETURNING id',
+      [u, pw, name, 'X', role, must]))[0].id;
+  const ids = {};
+  for (const [k, u, n, r] of [['req', 'req', 'ผู้ขอ', 'requester'], ['req2', 'req2', 'ผู้ขอสอง', 'requester'], ['a1', 'a1', 'บอส1', 'approver'],
+    ['a2', 'a2', 'บอส2', 'approver'], ['wh', 'wh', 'คลัง', 'warehouse'], ['admin', 'admin', 'แอดมิน', 'admin'], ['hr', 'hr', 'เอชอาร์', 'hr']])
+    ids[k] = await mk(u, n, r);
+  await db.run('INSERT INTO approver_links VALUES (?,?)', [ids.req, ids.a1]);
+  await db.run('INSERT INTO approver_links VALUES (?,?)', [ids.req, ids.a2]);
+  await db.run("INSERT INTO products (code,name,unit) VALUES ('P1','สินค้า 1','ชิ้น'),('P2','สินค้า 2','กล่อง')");
   const server = await new Promise((res) => { const s = app.listen(0, () => res(s)); });
   const base = `http://127.0.0.1:${server.address().port}`;
 
@@ -34,7 +34,7 @@ async function setup() {
     const login = await call('POST', '/login', { username, password });
     return { call, login };
   }
-  return { app, db, ids, client, close: () => server.close() };
+  return { app, db, ids, client, close: async () => { server.close(); await db.close(); } };
 }
 
 const tomorrow = () => new Date(Date.now() + 8 * 3600e3 + 86400e3).toISOString().slice(0, 10);
@@ -42,7 +42,7 @@ const reqBody = (extra = {}) => ({ type: 'give', purpose: 'trial', customer: '�
 
 test('login, forced password change, wrong password', async () => {
   const s = await setup();
-  s.db.prepare("UPDATE users SET must_change_password = 1 WHERE username = 'req2'").run();
+  await s.db.run("UPDATE users SET must_change_password = 1 WHERE username = 'req2'");
   assert.equal((await s.client('req', 'wrong')).login.status, 401);
   const c = await s.client('req2');
   assert.equal(c.login.status, 200);
@@ -50,7 +50,7 @@ test('login, forced password change, wrong password', async () => {
   assert.equal((await c.call('POST', '/change-password', { current_password: 'Passw0rd!', new_password: 'short' })).status, 400);
   assert.equal((await c.call('POST', '/change-password', { current_password: 'Passw0rd!', new_password: 'NewPassw0rd!' })).status, 200);
   assert.equal((await c.call('GET', '/my/requests')).status, 200);
-  s.close();
+  await s.close();
 });
 
 test('criteria 1-5: submit, notify, history, decision, reject reason', async () => {
@@ -77,7 +77,7 @@ test('criteria 1-5: submit, notify, history, decision, reject reason', async () 
   assert.equal(view.decision.approver_name, 'บอส1');
   const n = (await req.call('GET', '/notifications')).body.items;
   assert.ok(n.some((x) => x.message.includes('งบหมด')));
-  s.close();
+  await s.close();
 });
 
 test('criterion 3: simultaneous approvals -> exactly one decision', async () => {
@@ -91,8 +91,8 @@ test('criterion 3: simultaneous approvals -> exactly one decision', async () => 
     a2.call('POST', `/requests/${id}/decide`, { result: 'rejected', reason: 'y' }),
   ]);
   assert.equal(results.filter((r) => r.status === 200).length, 1);
-  assert.equal(s.db.prepare('SELECT COUNT(*) n FROM decisions WHERE request_id = ?').get(id).n, 1);
-  s.close();
+  assert.equal((await s.db.q('SELECT COUNT(*)::int n FROM decisions WHERE request_id = ?', [id]))[0].n, 1);
+  await s.close();
 });
 
 test('criteria 5-7: approve, partial dispense, continue, cancel remainder', async () => {
@@ -123,7 +123,7 @@ test('criteria 5-7: approve, partial dispense, continue, cancel remainder', asyn
   const it2 = (await wh.call('GET', '/requests/' + id2)).body.request.items;
   await wh.call('POST', `/requests/${id2}/dispense`, { lines: [{ item_id: it2[0].id, qty: 1 }] });
   assert.equal((await req.call('POST', `/requests/${id2}/cancel`, {})).body.status, 'completed');
-  s.close();
+  await s.close();
 });
 
 test('criterion 7: requester cancels before approval; cannot cancel after decision race', async () => {
@@ -133,7 +133,7 @@ test('criterion 7: requester cancels before approval; cannot cancel after decisi
   assert.equal((await req2.call('POST', `/requests/${id}/cancel`, {})).status, 404, "other requester can't touch it");
   assert.equal((await req.call('POST', `/requests/${id}/cancel`, {})).body.status, 'cancelled');
   assert.equal((await a1.call('POST', `/requests/${id}/decide`, { result: 'approved' })).status, 409);
-  s.close();
+  await s.close();
 });
 
 test('criterion 8: loan return (partial) and overdue notification + history', async () => {
@@ -149,7 +149,7 @@ test('criterion 8: loan return (partial) and overdue notification + history', as
   await wh.call('POST', `/requests/${id}/return`, { lines: [{ item_id: items[0].id, qty: 3 }] });
   assert.equal((await req.call('GET', '/my/requests')).body.loans[0].unreturned, 11);
   // make it overdue
-  s.db.prepare("UPDATE requests SET due_date = '2000-01-01' WHERE id = ?").run(id);
+  await s.db.run("UPDATE requests SET due_date = '2000-01-01' WHERE id = ?", [id]);
   const mine = (await req.call('GET', '/my/requests')).body;
   assert.equal(mine.loans[0].overdue, true);
   assert.ok((await req.call('GET', '/notifications')).body.items.some((x) => x.message.includes('เลยกำหนดคืน')));
@@ -164,7 +164,7 @@ test('criterion 8: loan return (partial) and overdue notification + history', as
   // return the rest: no longer outstanding
   await wh.call('POST', `/requests/${id}/return`, { lines: [{ item_id: items[0].id, qty: 7 }, { item_id: items[1].id, qty: 4 }] });
   assert.equal((await wh.call('GET', '/requests?view=loans')).body.requests.length, 0);
-  s.close();
+  await s.close();
 });
 
 test('criterion 9: HR create/deactivate/reset; history survives', async () => {
@@ -180,11 +180,11 @@ test('criterion 9: HR create/deactivate/reset; history survives', async () => {
   assert.equal((await hr.call('POST', `/users/${reqId}/active`, { active: false })).status, 200);
   assert.equal((await req.call('GET', '/my/requests')).status, 401, 'session dropped');
   assert.equal((await s.client('req')).login.status, 401, 'cannot login');
-  assert.equal(s.db.prepare('SELECT COUNT(*) n FROM requests WHERE id = ?').get(id).n, 1);
+  assert.equal((await s.db.q('SELECT COUNT(*)::int n FROM requests WHERE id = ?', [id]))[0].n, 1);
   await hr.call('POST', `/users/${reqId}/active`, { active: true });
   assert.equal((await hr.call('POST', `/users/${reqId}/reset-password`, { password: 'Reset12345' })).status, 200);
   assert.equal((await s.client('req', 'Reset12345')).login.body.user.must_change_password, true);
-  s.close();
+  await s.close();
 });
 
 test('criterion 10: products and approver re-link', async () => {
@@ -201,7 +201,7 @@ test('criterion 10: products and approver re-link', async () => {
   assert.equal((await a1.call('POST', `/requests/${ok.body.id}/decide`, { result: 'approved' })).status, 403);
   await admin.call('PUT', `/approver-links/${s.ids.req}`, { approver_ids: [] });
   assert.equal((await req.call('POST', '/requests', reqBody({ items: [{ product_id: 1, qty: 1 }] }))).status, 400, 'no approver');
-  s.close();
+  await s.close();
 });
 
 test('criterion 11: role isolation', async () => {
@@ -220,7 +220,7 @@ test('criterion 11: role isolation', async () => {
   assert.equal((await wh.call('GET', '/export')).status, 403);
   assert.equal((await wh.call('POST', `/requests/${id}/decide`, { result: 'approved' })).status, 403);
   assert.equal((await admin.call('POST', `/requests/${id}/decide`, { result: 'approved' })).status, 403);
-  s.close();
+  await s.close();
 });
 
 test('criterion 12: Excel export matches data', async () => {
@@ -241,7 +241,7 @@ test('criterion 12: Excel export matches data', async () => {
     ws.eachRow((row, n) => { if (n > 1) qtys.push(row.getCell(18).value); });
     assert.deepEqual(qtys.sort(), [10, 4, 7].sort());
   }
-  s.close();
+  await s.close();
 });
 
 test('static: app shell, manifest and service worker served', async () => {
@@ -249,5 +249,5 @@ test('static: app shell, manifest and service worker served', async () => {
   const server = await new Promise((res) => { const x = s.app.listen(0, () => res(x)); });
   const base = `http://127.0.0.1:${server.address().port}`;
   for (const p of ['/', '/manifest.json', '/sw.js', '/icon.svg', '/app.js']) assert.equal((await fetch(base + p)).status, 200, p);
-  server.close(); s.close();
+  server.close(); await s.close();
 });

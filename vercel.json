@@ -1,0 +1,5 @@
+{
+  "rewrites": [{ "source": "/api/(.*)", "destination": "/api" }],
+  "functions": { "api/index.js": { "maxDuration": 30 } },
+  "crons": [{ "path": "/api/cron/overdue", "schedule": "0 1 * * *" }]
+}
